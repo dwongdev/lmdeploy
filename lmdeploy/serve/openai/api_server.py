@@ -419,6 +419,8 @@ async def chat_completions_v1(raw_request: Request = None):
             ]
         else:
             tools = [item.function.model_dump() for item in request.tools]
+    # text completion for string input
+    do_preprocess = False if isinstance(request.messages, str) else request.do_preprocess
     result_generator = VariableInterface.async_engine.generate(
         request.messages,
         request.session_id,
@@ -427,7 +429,7 @@ async def chat_completions_v1(raw_request: Request = None):
         stream_response=True,  # always use stream to enable batching
         sequence_start=True,
         sequence_end=True,
-        do_preprocess=not isinstance(request.messages, str),  # text completion for string input
+        do_preprocess=do_preprocess,
         adapter_name=adapter_name,
         enable_thinking=request.enable_thinking,
     )
@@ -458,6 +460,7 @@ async def chat_completions_v1(raw_request: Request = None):
         previous_token_ids = []
         current_token_ids = []
         delta_token_ids = []
+        has_parser = VariableInterface.tool_parser is not None or VariableInterface.reasoning_parser is not None
         streaming_tools = False
         async for res in result_generator:
             logprobs, usage = None, None
@@ -472,16 +475,17 @@ async def chat_completions_v1(raw_request: Request = None):
                     total_tokens=total_tokens,
                 )
             delta_message = DeltaMessage(role='assistant', content=res.response)
-            if request.tool_choice != 'none' and VariableInterface.tool_parser is not None:
-                if res.finish_reason == 'stop' and streaming_tools is True:
-                    res.finish_reason = 'tool_calls'
+            if has_parser:
                 current_text = current_text + res.response
                 delta_token_ids = res.token_ids if res.token_ids is not None else []
                 current_token_ids = current_token_ids + delta_token_ids
+            if request.tool_choice != 'none' and VariableInterface.tool_parser is not None:
+                if res.finish_reason == 'stop' and streaming_tools is True:
+                    res.finish_reason = 'tool_calls'
                 tool_delta = VariableInterface.tool_parser.extract_tool_calls_streaming(
                     previous_text=previous_text,
                     current_text=current_text,
-                    delta_text=res.response,
+                    delta_text=delta_message.content,
                     previous_token_ids=previous_token_ids,
                     current_token_ids=current_token_ids,
                     delta_token_ids=delta_token_ids,
@@ -491,24 +495,20 @@ async def chat_completions_v1(raw_request: Request = None):
                     delta_message.content = tool_delta.content
                     if isinstance(tool_delta.tool_calls, List) and len(tool_delta.tool_calls):
                         streaming_tools = True
-                previous_text = current_text
-                previous_token_ids = current_token_ids
             elif request.tool_choice != 'none' and request.tools is not None and VariableInterface.tool_parser is None:
-                logger.error('Please lanuch the api_server with --tool-call-parser if you want to use tool.')
+                logger.error('Please launch the api_server with --tool-call-parser if you want to use tool.')
             if VariableInterface.reasoning_parser is not None:
-                current_text = current_text + res.response
-                delta_token_ids = res.token_ids if res.token_ids is not None else []
-                current_token_ids = current_token_ids + delta_token_ids
                 reasoning_delta = VariableInterface.reasoning_parser.extract_reasoning_content_streaming(
                     previous_text=previous_text,
                     current_text=current_text,
-                    delta_text=res.response,
+                    delta_text=delta_message.content or '',
                     previous_token_ids=previous_token_ids,
                     current_token_ids=current_token_ids,
                     delta_token_ids=delta_token_ids)
                 if reasoning_delta is not None:
                     delta_message.reasoning_content = reasoning_delta.reasoning_content
                     delta_message.content = reasoning_delta.content
+            if has_parser:
                 previous_text = current_text
                 previous_token_ids = current_token_ids
             response_json = create_stream_response_json(index=0,
@@ -561,7 +561,7 @@ async def chat_completions_v1(raw_request: Request = None):
             logger.error(f'Failed to parse {text}. Exception: {e}.')
             return create_error_response(HTTPStatus.BAD_REQUEST, 'Failed to parse fc related info to json format!')
     elif request.tool_choice != 'none' and request.tools is not None and VariableInterface.tool_parser is None:
-        logger.error('Please lanuch the api_server with --tool-call-parser if you want to use tool.')
+        logger.error('Please launch the api_server with --tool-call-parser if you want to use tool.')
 
     if VariableInterface.reasoning_parser is not None:
         reasoning_content, text = VariableInterface.reasoning_parser.extract_reasoning_content(text, request)
@@ -885,16 +885,16 @@ def update_params(request: UpdateParamsRequest, raw_request: Request = None):
 
 @router.get('/distserve/engine_info')
 async def engine_info():
-    engine = VariableInterface.async_engine.engine
+    engine_config = VariableInterface.async_engine.backend_config
 
-    response = DistServeEngineConfig(tp_size=engine.engine_config.tp,
-                                     dp_size=engine.engine_config.dp,
+    response = DistServeEngineConfig(tp_size=engine_config.tp,
+                                     dp_size=engine_config.dp,
                                      pp_size=None,
-                                     ep_size=engine.engine_config.ep,
-                                     dp_rank=engine.engine_config.dp_rank,
-                                     block_size=engine.engine_config.block_size,
-                                     num_cpu_blocks=engine.scheduler.block_manager.num_cpu_blocks,
-                                     num_gpu_blocks=engine.scheduler.block_manager.num_gpu_blocks)
+                                     ep_size=engine_config.ep,
+                                     dp_rank=engine_config.dp_rank,
+                                     block_size=engine_config.block_size,
+                                     num_cpu_blocks=engine_config.num_cpu_blocks,
+                                     num_gpu_blocks=engine_config.num_gpu_blocks)
 
     return response.model_dump_json()
 
@@ -1082,7 +1082,7 @@ async def startup_event():
         return
     try:
         import requests
-        engine_config = VariableInterface.async_engine.engine.engine_config
+        engine_config = VariableInterface.async_engine.backend_config
         engine_role = engine_config.role.value if hasattr(engine_config, 'role') else 1
         url = f'{VariableInterface.proxy_url}/nodes/add'
         data = {'url': VariableInterface.api_server_url, 'status': {'models': get_model_list(), 'role': engine_role}}
@@ -1093,6 +1093,13 @@ async def startup_event():
             raise HTTPException(status_code=response.status_code, detail=response.text)
     except Exception as e:
         logger.error(f'Service registration failed: {e}')
+
+
+@router.on_event('shutdown')
+async def shutdown_event():
+    async_engine = VariableInterface.async_engine
+    if async_engine is not None:
+        async_engine.close()
 
 
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -1256,6 +1263,8 @@ def serve(model_path: str,
 
     handle_torchrun()
     _, pipeline_class = get_task(model_path)
+    if isinstance(backend_config, PytorchEngineConfig):
+        backend_config.enable_mp_engine = True
     VariableInterface.async_engine = pipeline_class(model_path=model_path,
                                                     model_name=model_name,
                                                     backend=backend,
