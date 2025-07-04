@@ -120,7 +120,7 @@ def _build_dist_config(engine_config: PytorchEngineConfig):
 
 def _build_misc_config(engine_config: PytorchEngineConfig):
     """Build misc config."""
-    misc_config = MiscConfig(custom_module_map=engine_config.custom_module_map, empty_init=engine_config.empty_init)
+    misc_config = MiscConfig.from_engine_config(engine_config)
     return misc_config
 
 
@@ -160,19 +160,6 @@ class RunableEventBase:
         raise NotImplementedError('Not implemented.')
 
 
-class RunableEventSync(RunableEventBase):
-    """Awaitable sync runable event."""
-
-    def __init__(self, scheduler: Scheduler):
-        self.scheduler = scheduler
-
-    async def wait(self):
-        """Wait event."""
-
-    def set(self):
-        """Set event."""
-
-
 class RunableEventAsnyc(RunableEventBase):
     """Awaitable async runable event."""
 
@@ -184,13 +171,6 @@ class RunableEventAsnyc(RunableEventBase):
         """Wait event."""
         await self.event.wait()
 
-    def set_single(self):
-        """Set single."""
-        if self.scheduler.has_unfinished():
-            self.event.set()
-        else:
-            self.event.clear()
-
     def set(self):
         """Set event."""
         if self.scheduler.has_unfinished():
@@ -199,12 +179,9 @@ class RunableEventAsnyc(RunableEventBase):
             self.event.clear()
 
 
-def build_runable_event(scheduler: Scheduler, sync: bool):
+def build_runable_event(scheduler: Scheduler):
     """Build runable event."""
-    if sync:
-        return RunableEventSync(scheduler)
-    else:
-        return RunableEventAsnyc(scheduler)
+    return RunableEventAsnyc(scheduler)
 
 
 class InputsMakerBase:
@@ -234,7 +211,28 @@ class InputsMakerAsync(InputsMakerBase):
         self.scheduler = self.engine.scheduler
         self.forward_inputs = None
 
-    def do_prefill(self):
+        self.dp = self.engine.dist_config.dp
+        self.role = self.engine.cache_config.role
+
+        self.next_is_prefill = True
+        if self.dp == 1:
+            self.do_prefill = self.do_prefill_default
+        else:
+            self.do_prefill = self.do_prefill_dp
+
+    def do_prefill_dp(self):
+        if self.role == EngineRole.Prefill:
+            return True
+
+        scheduler = self.scheduler
+
+        if self.next_is_prefill:
+            ret = scheduler.has_waiting()
+        else:
+            ret = not scheduler.has_running()
+        return ret
+
+    def do_prefill_default(self):
         # decoding if no waiting
         scheduler = self.scheduler
         if not scheduler.has_waiting():
@@ -258,10 +256,11 @@ class InputsMakerAsync(InputsMakerBase):
             return None, None
         next_running = forward_inputs.pop('running')
         inputs = forward_inputs['inputs']
-        logger.info(f'Sending forward inputs: {inputs.log_info()}')
+        logger.debug(f'Sending forward inputs: {inputs.log_info()}')
         if logger.level <= logging.DEBUG:
             session_ids = [seq.session_id for seq in next_running]
             logger.debug(f'Forward session_ids: {session_ids}')
+        self.next_is_prefill = inputs.is_decoding
         await self.executor.forward_async(forward_inputs)
         self.forward_inputs = forward_inputs
         return forward_inputs, next_running
@@ -286,43 +285,15 @@ class InputsMakerAsync(InputsMakerBase):
 
         if enable:
             # send next forward
-            logger.info('Prefetching next forward inputs.')
+            logger.debug('Prefetching next forward inputs.')
             return await self._send_next_inputs_impl(prefill, True)
         else:
             return None, None
 
 
-class InputsMakerSync(InputsMakerAsync):
-    """Inputs maker synchronize."""
-
-    def __init__(self, engine: 'Engine'):
-        super().__init__(engine)
-        self._is_prefill = True
-
-    def do_prefill(self):
-        if self.engine.engine_config.role in [EngineRole.Hybrid, EngineRole.Decode]:
-            ret = self._is_prefill
-            self._is_prefill = not self._is_prefill
-        elif self.engine.engine_config.role == EngineRole.Prefill:
-            ret = True
-        return ret
-
-    async def send_next_inputs(self):
-        prefill = self.do_prefill()
-        return await self._send_next_inputs_impl(prefill)
-
-    async def prefetch_next_inputs(self):
-        """prefetch."""
-        logger.info('Prefetching next forward inputs.')
-        return await self.send_next_inputs()
-
-
 def build_inputs_maker(engine: 'Engine'):
     """Build inputs makers."""
-    if engine.should_execute_dummy_batch:
-        return InputsMakerSync(engine)
-    else:
-        return InputsMakerAsync(engine)
+    return InputsMakerAsync(engine)
 
 
 class Engine:
@@ -370,7 +341,6 @@ class Engine:
         backend_config = _build_backend_config(engine_config)
         dist_config = _build_dist_config(engine_config)
         misc_config = _build_misc_config(engine_config)
-        self.should_execute_dummy_batch = dist_config.need_dummy_batch()
 
         # build model agent
         raw_tokenizer = None
@@ -401,6 +371,8 @@ class Engine:
         self.backend_config = backend_config
         self.dist_config = dist_config
         self.max_session_len = self._get_max_session_len()
+        self.engine_config.num_cpu_blocks = self.cache_config.num_cpu_blocks
+        self.engine_config.num_gpu_blocks = self.cache_config.num_gpu_blocks
 
         self.req_manager = self._bind_request_manager()
 
@@ -435,6 +407,12 @@ class Engine:
             engine_config (PytorchEngineConfig): Pytorch engine config.
             trust_remote_code (bool): Trust remote code
         """
+        if engine_config is not None and engine_config.enable_mp_engine:
+            from .mp_engine.mp_engine import MPEngine
+            return MPEngine(model_path=pretrained_model_name_or_path,
+                            tokenizer=tokenizer,
+                            engine_config=engine_config,
+                            trust_remote_code=trust_remote_code)
         if len(kwargs) > 0:
             logger.debug(f'Get unexpected kwargs: {kwargs}')
         return cls(model_path=pretrained_model_name_or_path,
@@ -516,10 +494,10 @@ class Engine:
                 self.scheduler.stop_session(session_id)
                 session = self.scheduler.sessions[session_id]
                 for seq in session.sequences.values():
-                    resp: Response = getattr(seq, 'resp', None)
-                    if resp is not None:
-                        resp.type = ResponseType.FINISH
-                        self.req_manager.response(resp)
+                    _resp: Response = getattr(seq, 'resp', None)
+                    if _resp is not None:
+                        _resp.type = ResponseType.FINISH
+                        self.req_manager.response(_resp)
                 resp_type = ResponseType.SUCCESS
             if resp:
                 self._response(req.resp, resp_type)
@@ -531,9 +509,9 @@ class Engine:
             resp = req.data.get('response', True)
             resp_type = ResponseType.SESSION_NOT_EXIST
             if session_id in self.scheduler.sessions:
-                msg = list(self.scheduler.sessions[session_id].sequences.values())[0]
-                if msg.preserve_cache:
-                    self.scheduler._set_message_status(msg, MessageStatus.TO_BE_MIGRATED)
+                msgs = list(self.scheduler.sessions[session_id].sequences.values())
+                if len(msgs) > 0 and msgs[0].preserve_cache:
+                    self.scheduler._set_message_status(msgs[0], MessageStatus.TO_BE_MIGRATED)
                 else:
                     self.scheduler.end_session(session_id)
                 resp_type = ResponseType.SUCCESS
@@ -542,8 +520,14 @@ class Engine:
 
     def _on_add_message(self, reqs: List[Request], **kwargs):
         """On add message callback."""
+        valid_reqs = []
         for req in reqs:
             req_data = req.data
+            session_id = req_data['session_id']
+            if self.scheduler and session_id not in self.scheduler.sessions:
+                self._response(req.resp, ResponseType.SESSION_NOT_EXIST)
+                continue
+            valid_reqs.append(req)
             if req_data.get('input_multimodals', None) is None:
                 continue
             elif self.input_processor is None:
@@ -562,8 +546,8 @@ class Engine:
             req_data['token_ids'] = input_ids
             req_data['input_multimodals'] = input_multimodals
 
-        if len(reqs) > 0:
-            self._add_message(reqs)
+        if len(valid_reqs) > 0:
+            self._add_message(valid_reqs)
 
     def _add_message(self, reqs: List[Request]):
 
@@ -873,33 +857,8 @@ class Engine:
             """Need logits."""
             return any(seq.return_logits for seq in seqs)
 
-        def __make_dummy_inputs():
-            """Make dummy inputs."""
-            logger.info(f'make dummy forward inputs: prefill={prefill}.')
-            num_loops = 1 if prefill else prefill_interval
-
-            batch_size = 2 if self.dist_config.enable_microbatch else 1
-            batch_size = min(self.cache_config.max_batches, batch_size)
-            return dict(
-                running=[],
-                inputs=ModelInputs.make_dummy(batch_size,
-                                              is_decoding=not prefill,
-                                              vocab_size=self.model_config.vocab_size),
-                swap_in_map=dict(),
-                swap_out_map=dict(),
-                loop_count=num_loops,
-                is_dummy=True,
-                sync_long_context=False,
-            )
-
         scheduler = self.scheduler
-        logger.info(f'Make forward inputs with prefill={prefill}, enable_empty={enable_empty}')
-
-        if self.should_execute_dummy_batch:
-            if prefill and scheduler.num_waiting() == 0:
-                return __make_dummy_inputs()
-            if not prefill and scheduler.num_running() == 0:
-                return __make_dummy_inputs()
+        logger.debug(f'Make forward inputs with prefill={prefill}, enable_empty={enable_empty}')
 
         scheduler_output = scheduler.schedule(is_prefill=prefill, prealloc_size=prefill_interval)
 
@@ -907,9 +866,7 @@ class Engine:
             return None
 
         # schedule decoding if no valid prefill reqs.
-        if prefill and len(
-                scheduler_output.running
-        ) == 0 and not self.should_execute_dummy_batch and self.engine_config.role != EngineRole.Prefill:
+        if prefill and len(scheduler_output.running) == 0 and self.engine_config.role != EngineRole.Prefill:
             prefill = False
             scheduler_output = scheduler.schedule(is_prefill=prefill, prealloc_size=prefill_interval)
 
@@ -917,9 +874,6 @@ class Engine:
         running = scheduler_output.running
         swap_in_map = scheduler_output.swap_in_map
         swap_out_map = scheduler_output.swap_out_map
-
-        if (self.should_execute_dummy_batch or self.engine_config.role == EngineRole.Prefill) and len(running) == 0:
-            return __make_dummy_inputs()
 
         assert len(running) > 0
 
@@ -1144,7 +1098,7 @@ class Engine:
 
             # preprocess task
             logger.info('Starting async task MainLoopPreprocessMessage.')
-            has_runable_event = build_runable_event(self.scheduler, self.should_execute_dummy_batch)
+            has_runable_event = build_runable_event(self.scheduler)
             loop_msg_proc = event_loop.create_task(self._async_loop_preprocess_message(
                 forward_event, has_runable_event),
                                                    name='MainLoopPreprocessMessage')
@@ -1177,7 +1131,8 @@ class Engine:
                                         forward_event=forward_event,
                                         has_runable_event=has_runable_event,
                                         inputs_maker=inputs_maker)
-
+        except Exception as e:
+            logger.error(f'exception happened: {type(e)} {e}')
         finally:
             self._loop_finally()
 
@@ -1204,3 +1159,24 @@ class Engine:
             return True
         self.req_manager.create_loop_task()
         return True
+
+    def end_session(self, session_id: int):
+        """End session."""
+        if session_id in self.scheduler.sessions:
+            self.scheduler.end_session(session_id)
+            return True
+        return False
+
+    def p2p_initialize(self, conn_request):
+        """Init rdma link."""
+        return self.executor.p2p_initialize(conn_request)
+
+    def p2p_connect(self, conn_request):
+        """rdma_connect."""
+        return self.executor.p2p_connect(conn_request)
+
+    def get_model_config(self):
+        return self.model_config
+
+    def get_engine_config(self):
+        return self.engine_config
